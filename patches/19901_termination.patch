@@ -1,0 +1,299 @@
+diff --git a/include/mesos/mesos.proto b/include/mesos/mesos.proto
+index 37f8a7f..bf02fe1 100644
+--- a/include/mesos/mesos.proto
++++ b/include/mesos/mesos.proto
+@@ -473,3 +473,17 @@ message Credential {
+   required string principal = 1;
+   optional bytes secret = 2;
+ }
++
++
++/**
++ * Information about a container termination.
++ */
++message Termination {
++  // A container may be killed if it exceeds its resources; this will be
++  // indicated by killed=true and described by the message string.
++  required bool killed = 1;
++  required string message = 2;
++
++  // Exit status of the process.
++  optional int32 status = 3;
++}
+diff --git a/src/slave/containerizer/containerizer.hpp b/src/slave/containerizer/containerizer.hpp
+index 6cf351e..6fc3822 100644
+--- a/src/slave/containerizer/containerizer.hpp
++++ b/src/slave/containerizer/containerizer.hpp
+@@ -50,26 +50,6 @@ struct SlaveState;
+ class Containerizer
+ {
+ public:
+-  // Information about a container termination.
+-  struct Termination
+-  {
+-    Termination(
+-        const Option<int>& _status,
+-        bool _killed,
+-        const std::string& _message)
+-      : status(_status),
+-        killed(_killed),
+-        message(_message) {}
+-
+-    // Exit status of the executor.
+-    const Option<int> status;
+-
+-    // A container may be killed if it exceeds its resources; this will be
+-    // indicated by killed=true and described by the message string.
+-    const bool killed;
+-    const std::string message;
+-  };
+-
+   // Attempts to create a containerizer as specified by 'isolation' in flags.
+   static Try<Containerizer*> create(const Flags& flags, bool local);
+ 
+diff --git a/src/slave/containerizer/mesos_containerizer.hpp b/src/slave/containerizer/mesos_containerizer.hpp
+index db1fd85..f3cbbc5 100644
+--- a/src/slave/containerizer/mesos_containerizer.hpp
++++ b/src/slave/containerizer/mesos_containerizer.hpp
+@@ -68,7 +68,7 @@ public:
+   virtual process::Future<ResourceStatistics> usage(
+       const ContainerID& containerId);
+ 
+-  virtual process::Future<Containerizer::Termination> wait(
++  virtual process::Future<Termination> wait(
+       const ContainerID& containerId);
+ 
+   virtual void destroy(const ContainerID& containerId);
+@@ -113,7 +113,7 @@ public:
+   process::Future<ResourceStatistics> usage(
+       const ContainerID& containerId);
+ 
+-  process::Future<Containerizer::Termination> wait(
++  process::Future<Termination> wait(
+       const ContainerID& containerId);
+ 
+   void destroy(const ContainerID& containerId);
+@@ -185,7 +185,7 @@ private:
+   // struct.
+   // Promises for futures returned from wait().
+   hashmap<ContainerID,
+-    process::Owned<process::Promise<Containerizer::Termination> > > promises;
++    process::Owned<process::Promise<Termination> > > promises;
+ 
+   // We need to keep track of the future exit status for each executor because
+   // we'll only get a single notification when the executor exits.
+diff --git a/src/slave/containerizer/mesos_containerizer.cpp b/src/slave/containerizer/mesos_containerizer.cpp
+index e74ef60..6fd4035 100644
+--- a/src/slave/containerizer/mesos_containerizer.cpp
++++ b/src/slave/containerizer/mesos_containerizer.cpp
+@@ -157,7 +157,7 @@ Future<ResourceStatistics> MesosContainerizer::usage(
+ }
+ 
+ 
+-Future<Containerizer::Termination> MesosContainerizer::wait(
++Future<Termination> MesosContainerizer::wait(
+     const ContainerID& containerId)
+ {
+   return dispatch(process, &MesosContainerizerProcess::wait, containerId);
+@@ -249,8 +249,7 @@ Future<Nothing> MesosContainerizerProcess::_recover(
+     CHECK_SOME(run.id);
+     const ContainerID& containerId = run.id.get();
+ 
+-    Owned<Promise<Containerizer::Termination> > promise(
+-        new Promise<Containerizer::Termination>());
++    Owned<Promise<Termination> > promise(new Promise<Termination>());
+     promises.put(containerId, promise);
+ 
+     CHECK_SOME(run.forkedPid);
+@@ -442,8 +441,7 @@ Future<ExecutorInfo> MesosContainerizerProcess::launch(
+     return Failure("Container already started");
+   }
+ 
+-  Owned<Promise<Containerizer::Termination> > promise(
+-      new Promise<Containerizer::Termination>());
++  Owned<Promise<Termination> > promise(new Promise<Termination>());
+   promises.put(containerId, promise);
+ 
+   // Store the resources for usage().
+@@ -750,7 +748,7 @@ Future<ExecutorInfo> MesosContainerizerProcess::exec(
+ }
+ 
+ 
+-Future<Containerizer::Termination> MesosContainerizerProcess::wait(
++Future<Termination> MesosContainerizerProcess::wait(
+     const ContainerID& containerId)
+ {
+   if (!promises.contains(containerId)) {
+@@ -923,10 +921,14 @@ void MesosContainerizerProcess::__destroy(
+     isolator->cleanup(containerId);
+   }
+ 
+-  promises[containerId]->set(Containerizer::Termination(
+-        status.isReady() ? status.get() : None(),
+-        killed,
+-        message));
++  Termination termination;
++  termination.set_killed(killed);
++  termination.set_message(message);
++  if (status.isReady() && status.get().isSome()) {
++    termination.set_status(status.get().get());
++  }
++
++  promises[containerId]->set(termination);
+ 
+   promises.erase(containerId);
+   statuses.erase(containerId);
+diff --git a/src/slave/slave.hpp b/src/slave/slave.hpp
+index aa6302a..a370ccb 100644
+--- a/src/slave/slave.hpp
++++ b/src/slave/slave.hpp
+@@ -223,13 +223,13 @@ public:
+   void executorTerminated(
+       const FrameworkID& frameworkId,
+       const ExecutorID& executorId,
+-      const process::Future<Containerizer::Termination>& termination);
++      const process::Future<Termination>& termination);
+ 
+   void _executorTerminated(
+       const process::Future<ExecutorInfo>& future,
+       const FrameworkID& frameworkId,
+       const ExecutorID& executorId,
+-      const process::Future<Containerizer::Termination>& termination,
++      const process::Future<Termination>& termination,
+       int status);
+ 
+ 
+diff --git a/src/slave/slave.cpp b/src/slave/slave.cpp
+index 9a0bf32..7540fa0 100644
+--- a/src/slave/slave.cpp
++++ b/src/slave/slave.cpp
+@@ -2374,7 +2374,7 @@ void _unmonitor(
+ void Slave::executorTerminated(
+     const FrameworkID& frameworkId,
+     const ExecutorID& executorId,
+-    const Future<Containerizer::Termination>& termination)
++    const Future<Termination>& termination)
+ {
+   int status;
+   // A termination failure indicates the containerizer could not destroy a
+@@ -2390,14 +2390,14 @@ void Slave::executorTerminated(
+                    : "discarded");
+     // Set a special status for failure.
+     status = -1;
+-  } else if (termination.get().status.isNone()) {
++  } else if (!termination.get().has_status()) {
+     LOG(INFO) << "Executor '" << executorId
+               << "' of framework " << frameworkId
+               << " has terminated with unknown status";
+     // Set a special status for None.
+     status = -1;
+   } else {
+-    status = termination.get().status.get();
++    status = termination.get().status();
+     LOG(INFO) << "Executor '" << executorId
+               << "' of framework " << frameworkId
+               << (WIFEXITED(status)
+@@ -2443,7 +2443,7 @@ void Slave::_executorTerminated(
+     const Future<ExecutorInfo>& future,
+     const FrameworkID& frameworkId,
+     const ExecutorID& executorId,
+-    const Future<Containerizer::Termination>& termination,
++    const Future<Termination>& termination,
+     int status)
+ {
+   Framework* framework = getFramework(frameworkId);
+@@ -2481,7 +2481,7 @@ void Slave::_executorTerminated(
+         foreach (Task* task, executor->launchedTasks.values()) {
+           if (!protobuf::isTerminalState(task->state())) {
+             mesos::TaskState taskState;
+-            if ((termination.isReady() && termination.get().killed) ||
++            if ((termination.isReady() && termination.get().killed()) ||
+                  executor->commandExecutor) {
+               taskState = TASK_FAILED;
+             } else {
+@@ -2492,7 +2492,7 @@ void Slave::_executorTerminated(
+                 info.id(),
+                 task->task_id(),
+                 taskState,
+-                termination.isReady() ? termination.get().message :
++                termination.isReady() ? termination.get().message() :
+                                         "Abnormal executor termination",
+                 executorId),
+                 UPID());
+@@ -2504,7 +2504,7 @@ void Slave::_executorTerminated(
+         // supports it.
+         foreach (const TaskInfo& task, executor->queuedTasks.values()) {
+           mesos::TaskState taskState;
+-          if ((termination.isReady() && termination.get().killed) ||
++          if ((termination.isReady() && termination.get().killed()) ||
+                executor->commandExecutor) {
+             taskState = TASK_FAILED;
+           } else {
+@@ -2515,7 +2515,7 @@ void Slave::_executorTerminated(
+               info.id(),
+               task.task_id(),
+               taskState,
+-              termination.isReady() ? termination.get().message :
++              termination.isReady() ? termination.get().message() :
+                                       "Abnormal executor termination",
+               executorId),
+               UPID());
+diff --git a/src/tests/containerizer.hpp b/src/tests/containerizer.hpp
+index 6eeeb6e..d38a61d 100644
+--- a/src/tests/containerizer.hpp
++++ b/src/tests/containerizer.hpp
+@@ -74,7 +74,7 @@ public:
+       const process::PID<slave::Slave>& slavePid,
+       bool checkpoint);
+ 
+-  virtual process::Future<slave::Containerizer::Termination> wait(
++  virtual process::Future<Termination> wait(
+       const ContainerID& containerId);
+ 
+   // Additional destroy method for testing because we won't know the
+@@ -103,7 +103,7 @@ private:
+   hashmap<std::pair<FrameworkID, ExecutorID>, ContainerID> containers;
+   hashmap<ContainerID, process::Owned<MesosExecutorDriver> > drivers;
+   hashmap<ContainerID,
+-          process::Owned<process::Promise<slave::Containerizer::Termination> > > promises;
++          process::Owned<process::Promise<Termination> > > promises;
+ };
+ 
+ } // namespace tests {
+diff --git a/src/tests/containerizer.cpp b/src/tests/containerizer.cpp
+index 55a4c9e..37c16bc 100644
+--- a/src/tests/containerizer.cpp
++++ b/src/tests/containerizer.cpp
+@@ -132,16 +132,14 @@ Future<ExecutorInfo> TestContainerizer::launch(
+   }
+   os::unsetenv("MESOS_LOCAL");
+ 
+-  Owned<Promise<slave::Containerizer::Termination> > promise(
+-      new Promise<slave::Containerizer::Termination>());
++  Owned<Promise<Termination> > promise(new Promise<Termination>());
+   promises[containerId] = promise;
+ 
+   return executorInfo;
+ }
+ 
+ 
+-Future<slave::Containerizer::Termination> TestContainerizer::wait(
+-    const ContainerID& containerId)
++Future<Termination> TestContainerizer::wait(const ContainerID& containerId)
+ {
+   CHECK(promises.contains(containerId))
+     << "Container " << containerId << "not started";
+@@ -175,8 +173,11 @@ void TestContainerizer::destroy(const ContainerID& containerId)
+   driver->join();
+   drivers.erase(containerId);
+ 
+-  promises[containerId]->set(
+-      slave::Containerizer::Termination(0, false, "Killed executor"));
++  Termination termination;
++  termination.set_killed(false);
++  termination.set_message("Killed executor");
++  termination.set_status(0);
++  promises[containerId]->set(termination);
+   promises.erase(containerId);
+ }
+ 

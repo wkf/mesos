@@ -1,0 +1,216 @@
+diff --git a/src/tests/containerizer.hpp b/src/tests/containerizer.hpp
+index a9f15318803aeb41489a48d7e9e94caa97d71456..c40bbcd03bea965603cc64ad36289e35413538e6 100644
+--- a/src/tests/containerizer.hpp
++++ b/src/tests/containerizer.hpp
+@@ -64,14 +64,16 @@ public:
+ 
+   virtual ~TestContainerizer();
+ 
+-  virtual process::Future<Nothing> launch(
+-      const ContainerID& containerId,
+-      const ExecutorInfo& executorInfo,
+-      const std::string& directory,
+-      const Option<std::string>& user,
+-      const SlaveID& slaveId,
+-      const process::PID<slave::Slave>& slavePid,
+-      bool checkpoint);
++  MOCK_METHOD7(
++      launch,
++      process::Future<Nothing>(
++          const ContainerID&,
++          const ExecutorInfo&,
++          const std::string&,
++          const Option<std::string>&,
++          const SlaveID&,
++          const process::PID<slave::Slave>&,
++          bool checkpoint));
+ 
+   virtual process::Future<slave::Containerizer::Termination> wait(
+       const ContainerID& containerId);
+@@ -97,6 +99,16 @@ public:
+ private:
+   void setup();
+ 
++  // Default 'launch' implementation.
++  process::Future<Nothing> _launch(
++      const ContainerID& containerId,
++      const ExecutorInfo& executorInfo,
++      const std::string& directory,
++      const Option<std::string>& user,
++      const SlaveID& slaveId,
++      const process::PID<slave::Slave>& slavePid,
++      bool checkpoint);
++
+   hashmap<ExecutorID, Executor*> executors;
+ 
+   hashmap<std::pair<FrameworkID, ExecutorID>, ContainerID> containers;
+diff --git a/src/tests/containerizer.cpp b/src/tests/containerizer.cpp
+index bfb93412b801a24ac77bf621d55ebb00bfd4fdd7..1375fc7abe9b04079d63d3770254356c0d3445f4 100644
+--- a/src/tests/containerizer.cpp
++++ b/src/tests/containerizer.cpp
+@@ -22,6 +22,10 @@
+ using std::map;
+ using std::string;
+ 
++using testing::_;
++using testing::Invoke;
++using testing::Return;
++
+ using namespace process;
+ 
+ namespace mesos {
+@@ -69,7 +73,7 @@ TestContainerizer::~TestContainerizer()
+ }
+ 
+ 
+-Future<Nothing> TestContainerizer::launch(
++Future<Nothing> TestContainerizer::_launch(
+     const ContainerID& containerId,
+     const ExecutorInfo& executorInfo,
+     const string& directory,
+@@ -140,8 +144,11 @@ Future<Nothing> TestContainerizer::launch(
+ Future<slave::Containerizer::Termination> TestContainerizer::wait(
+     const ContainerID& containerId)
+ {
+-  CHECK(promises.contains(containerId))
+-    << "Container " << containerId << "not started";
++  // An unknown container is possible for tests where we "drop" the
++  // 'launch' in order to verify recovery still works correctly.
++  if (!promises.contains(containerId)) {
++    return Failure("Unknown container: " + stringify(containerId));
++  }
+ 
+   return promises[containerId]->future();
+ }
+@@ -180,14 +187,22 @@ void TestContainerizer::destroy(const ContainerID& containerId)
+ 
+ void TestContainerizer::setup()
+ {
+-  EXPECT_CALL(*this, recover(testing::_))
+-    .WillRepeatedly(testing::Return(Nothing()));
+-
+-  EXPECT_CALL(*this, usage(testing::_))
+-    .WillRepeatedly(testing::Return(ResourceStatistics()));
+-
+-  EXPECT_CALL(*this, update(testing::_, testing::_))
+-    .WillRepeatedly(testing::Return(Nothing()));
++  // NOTE: We use 'EXPECT_CALL' and 'WillRepeatedly' here instead of
++  // ON_CALL and WillByDefault because the former gives the gmock
++  // warning "Uninteresting mock function call" unless each tests puts
++  // the expectations in place which would make the tests much more
++  // verbose.
++  EXPECT_CALL(*this, recover(_))
++    .WillRepeatedly(Return(Nothing()));
++
++  EXPECT_CALL(*this, usage(_))
++    .WillRepeatedly(Return(ResourceStatistics()));
++
++  EXPECT_CALL(*this, update(_, _))
++    .WillRepeatedly(Return(Nothing()));
++
++  EXPECT_CALL(*this, launch(_, _, _, _, _, _, _))
++    .WillRepeatedly(Invoke(this, &TestContainerizer::_launch));
+ }
+ 
+ } // namespace tests {
+diff --git a/src/tests/slave_recovery_tests.cpp b/src/tests/slave_recovery_tests.cpp
+index 395765a91ff1ca38c5e27f3869b11e665ef969f7..241861113b744b6d89655b9d85f57683ac3a25db 100644
+--- a/src/tests/slave_recovery_tests.cpp
++++ b/src/tests/slave_recovery_tests.cpp
+@@ -52,6 +52,7 @@
+ 
+ #include "messages/messages.hpp"
+ 
++#include "tests/containerizer.hpp"
+ #include "tests/mesos.hpp"
+ #include "tests/utils.hpp"
+ 
+@@ -73,6 +74,7 @@ using std::vector;
+ 
+ using testing::_;
+ using testing::AtMost;
++using testing::DoAll;
+ using testing::Eq;
+ using testing::Return;
+ using testing::SaveArg;
+@@ -2976,3 +2978,80 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
+   delete containerizer3.get();
+   delete containerizer4.get();
+ }
++
++
++// The slave is stopped after it dispatched Containerizer::launch but
++// before the containerizer has processed the launch. When the slave
++// comes back up it should send a TASK_LOST for the task.
++// NOTE: This is a 'TYPED_TEST' but we don't use 'TypeParam'.
++TYPED_TEST(SlaveRecoveryTest, RestartBeforeContainerizerLaunch)
++{
++  Try<PID<Master> > master = this->StartMaster();
++  ASSERT_SOME(master);
++
++  slave::Flags flags = this->CreateSlaveFlags();
++
++  TestContainerizer* containerizer1 = new TestContainerizer();
++
++  Try<PID<Slave> > slave = this->StartSlave(containerizer1, flags);
++  ASSERT_SOME(slave);
++
++  MockScheduler sched;
++
++  // Enable checkpointing for the framework.
++  FrameworkInfo frameworkInfo;
++  frameworkInfo.CopyFrom(DEFAULT_FRAMEWORK_INFO);
++  frameworkInfo.set_checkpoint(true);
++
++  MesosSchedulerDriver driver(
++      &sched, frameworkInfo, master.get(), DEFAULT_CREDENTIAL);
++
++  EXPECT_CALL(sched, registered(_, _, _));
++
++  Future<vector<Offer> > offers;
++  EXPECT_CALL(sched, resourceOffers(_, _))
++    .WillOnce(FutureArg<1>(&offers))
++    .WillRepeatedly(Return());      // Ignore subsequent offers.
++
++  driver.start();
++
++  AWAIT_READY(offers);
++  EXPECT_NE(0u, offers.get().size());
++
++  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
++  vector<TaskInfo> tasks;
++  tasks.push_back(task); // Long-running task.
++
++  // Expect the launch but don't do anything.
++  Future<Nothing> launch;
++  EXPECT_CALL(*containerizer1, launch(_, _, _, _, _, _, _))
++    .WillOnce(DoAll(FutureSatisfy(&launch),
++                    Return(Future<Nothing>())));
++
++  driver.launchTasks(offers.get()[0].id(), tasks);
++
++  // Once we get the launch restart the slave.
++  AWAIT_READY(launch);
++
++  this->Stop(slave.get());
++  delete containerizer1;
++
++  Future<TaskStatus> status;
++  EXPECT_CALL(sched, statusUpdate(_, _))
++    .WillOnce(FutureArg<1>(&status));
++
++  TestContainerizer* containerizer2 = new TestContainerizer();
++
++  slave = this->StartSlave(containerizer2, flags);
++  ASSERT_SOME(slave);
++
++  // Scheduler should receive an update for the lost task.
++  AWAIT_READY(status);
++  ASSERT_EQ(TASK_LOST, status.get().state());
++
++  driver.stop();
++  driver.join();
++
++  this->Shutdown();
++  delete containerizer2;
++}

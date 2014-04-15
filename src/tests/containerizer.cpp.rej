@@ -1,0 +1,33 @@
+***************
+*** 129,143 ****
+    }
+    os::unsetenv("MESOS_LOCAL");
+  
+-   Owned<Promise<slave::Containerizer::Termination> > promise(
+-       new Promise<slave::Containerizer::Termination>());
+    promises[containerId] = promise;
+  
+    return Nothing();
+  }
+  
+  
+- Future<slave::Containerizer::Termination> TestContainerizer::wait(
+      const ContainerID& containerId)
+  {
+    CHECK(promises.contains(containerId))
+--- 129,143 ----
+    }
+    os::unsetenv("MESOS_LOCAL");
+  
++   Owned<Promise<containerizer::Termination> > promise(
++       new Promise<containerizer::Termination>());
+    promises[containerId] = promise;
+  
+    return Nothing();
+  }
+  
+  
++ Future<containerizer::Termination> TestContainerizer::wait(
+      const ContainerID& containerId)
+  {
+    CHECK(promises.contains(containerId))

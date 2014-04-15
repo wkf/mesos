@@ -185,11 +185,8 @@ void TestContainerizer::destroy(const ContainerID& containerId)
   driver->join();
   drivers.erase(containerId);
 
-  containerizer::Termination termination;
-  termination.set_killed(false);
-  termination.set_message("Killed executor");
-  termination.set_status(0);
-  promises[containerId]->set(termination);
+  promises[containerId]->set(
+      slave::Containerizer::Termination(0, false, "Killed executor"));
   promises.erase(containerId);
 }
 

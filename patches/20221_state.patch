@@ -1,0 +1,103 @@
+diff --git a/src/slave/slave.cpp b/src/slave/slave.cpp
+index cddb241..7b2f874 100644
+--- a/src/slave/slave.cpp
++++ b/src/slave/slave.cpp
+@@ -3113,6 +3113,10 @@ void Framework::recoverExecutor(const ExecutorState& state)
+   const string& directory = paths::getExecutorRunPath(
+       slave->flags.work_dir, slave->info.id(), id, state.id, latest);
+ 
++  // The executor info is checkpointed before any run state is and we
++  // can therefore rely on the presence of the info here. Without any
++  // present runs, executor recovery is aborted on entry.
++  CHECK_SOME(state.info);
+   Executor* executor = new Executor(
+       slave, id, state.info.get(), latest, directory, info.checkpoint());
+ 
+diff --git a/src/slave/state.cpp b/src/slave/state.cpp
+index 21d1fb7..a18179c 100644
+--- a/src/slave/state.cpp
++++ b/src/slave/state.cpp
+@@ -274,41 +274,6 @@ Try<ExecutorState> ExecutorState::recover(
+   state.id = executorId;
+   string message;
+ 
+-  // Read the executor info.
+-  const string& path =
+-    paths::getExecutorInfoPath(rootDir, slaveId, frameworkId, executorId);
+-  if (!os::exists(path)) {
+-    // This could happen if the slave died after creating the executor
+-    // directory but before it checkpointed the executor info.
+-    LOG(WARNING) << "Failed to find executor info file '" << path << "'";
+-    return state;
+-  }
+-
+-  const Result<ExecutorInfo>& executorInfo =
+-    ::protobuf::read<ExecutorInfo>(path);
+-
+-  if (executorInfo.isError()) {
+-    message = "Failed to read executor info from '" + path + "': " +
+-              executorInfo.error();
+-
+-    if (strict) {
+-      return Error(message);
+-    } else {
+-      LOG(WARNING) << message;
+-      state.errors++;
+-      return state;
+-    }
+-  }
+-
+-  if (executorInfo.isNone()) {
+-    // This could happen if the slave died after opening the file for
+-    // writing but before it checkpointed anything.
+-    LOG(WARNING) << "Found empty executor info file '" << path << "'";
+-    return state;
+-  }
+-
+-  state.info = executorInfo.get();
+-
+   // Find the runs.
+   Try<list<string> > runs = os::glob(strings::format(
+       paths::EXECUTOR_RUN_PATH,
+@@ -368,6 +333,41 @@ Try<ExecutorState> ExecutorState::recover(
+     return state;
+   }
+ 
++  // Read the executor info.
++  const string& path =
++    paths::getExecutorInfoPath(rootDir, slaveId, frameworkId, executorId);
++  if (!os::exists(path)) {
++    // This could happen if the slave died after creating the executor
++    // directory but before it checkpointed the executor info.
++    LOG(WARNING) << "Failed to find executor info file '" << path << "'";
++    return state;
++  }
++
++  const Result<ExecutorInfo>& executorInfo =
++    ::protobuf::read<ExecutorInfo>(path);
++
++  if (executorInfo.isError()) {
++    message = "Failed to read executor info from '" + path + "': " +
++              executorInfo.error();
++
++    if (strict) {
++      return Error(message);
++    } else {
++      LOG(WARNING) << message;
++      state.errors++;
++      return state;
++    }
++  }
++
++  if (executorInfo.isNone()) {
++    // This could happen if the slave died after opening the file for
++    // writing but before it checkpointed anything.
++    LOG(WARNING) << "Found empty executor info file '" << path << "'";
++    return state;
++  }
++
++  state.info = executorInfo.get();
++
+   return state;
+ }
+ 

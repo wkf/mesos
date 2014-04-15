@@ -1,0 +1,2225 @@
+diff --git a/configure.ac b/configure.ac
+index c1de6d7..8eaa3d5 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -591,6 +591,8 @@ There are two possible workarounds for this issue:
+                   [chmod +x src/examples/python/test-executor])
+   AC_CONFIG_FILES([src/examples/python/test-framework],
+                   [chmod +x src/examples/python/test-framework])
++  AC_CONFIG_FILES([src/examples/python/test-containerizer],
++                  [chmod +x src/examples/python/test-containerizer])
+   AC_CONFIG_FILES([src/python/setup.py])
+ 
+   # When clang is being used, make sure that the distutils python-
+diff --git a/include/mesos/mesos.proto b/include/mesos/mesos.proto
+index bf02fe1..b729ad8 100644
+--- a/include/mesos/mesos.proto
++++ b/include/mesos/mesos.proto
+@@ -137,9 +137,18 @@ message CommandInfo {
+     optional bool executable = 2;
+   }
+ 
++  // Describes a container that may be used once external isolation has been
++  // selected for the slave.
++  message ContainerInfo {
++    required string image = 1;
++    repeated string options = 2;
++  }
++
+   repeated URI uris = 1;
+   optional Environment environment = 2;
+   required string value = 3;
++
++  optional ContainerInfo container = 4;
+ }
+ 
+ 
+@@ -487,3 +496,31 @@ message Termination {
+   // Exit status of the process.
+   optional int32 status = 3;
+ }
++
++
++/**
++ * Collection of Resource.
++ */
++message ResourceArray {
++  repeated Resource resource = 1;
++}
++
++
++/**
++ * Describes an external containerizer's status.
++ */
++message ExternalStatus {
++  // This message does not have to adhere to any scheme.
++  required string message = 1;
++  // Launched executor pid.
++  optional uint32 pid = 2;
++}
++
++
++/**
++ * Describes an external containerizer's task.
++ */
++message ExternalTask {
++  required TaskInfo task = 1;
++  required string mesos_executor_path = 2;
++}
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 95f133d..e9e6fc4 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -185,6 +185,7 @@ libmesos_no_3rdparty_la_SOURCES =					\
+ 	slave/containerizer/isolator.cpp				\
+ 	slave/containerizer/launcher.cpp				\
+ 	slave/containerizer/mesos_containerizer.cpp			\
++	slave/containerizer/external_containerizer.cpp			\
+ 	slave/status_update_manager.cpp					\
+ 	exec/exec.cpp							\
+ 	common/lock.cpp							\
+@@ -250,6 +251,7 @@ libmesos_no_3rdparty_la_SOURCES += common/attributes.hpp		\
+ 	slave/containerizer/isolators/posix.hpp				\
+ 	slave/containerizer/launcher.hpp				\
+ 	slave/containerizer/mesos_containerizer.hpp			\
++	slave/containerizer/external_containerizer.hpp			\
+ 	slave/flags.hpp slave/gc.hpp slave/monitor.hpp			\
+ 	slave/paths.hpp slave/state.hpp					\
+ 	slave/status_update_manager.hpp					\
+@@ -873,6 +875,7 @@ mesos_tests_SOURCES =				\
+   tests/flags.cpp				\
+   tests/gc_tests.cpp				\
+   tests/isolator_tests.cpp			\
++  tests/external_containerizer_test.cpp		\
+   tests/log_tests.cpp				\
+   tests/logging_tests.cpp			\
+   tests/main.cpp				\
+@@ -939,7 +942,9 @@ if HAS_PYTHON
+   EXAMPLESCRIPTSPYTHON = examples/python/test_framework.py		\
+ 			 examples/python/test-framework			\
+ 			 examples/python/test_executor.py		\
+-			 examples/python/test-executor
++			 examples/python/test-executor			\
++			 examples/python/test_containerizer.py		\
++			 examples/python/test-containerizer
+ 
+   check_SCRIPTS += $(EXAMPLESCRIPTSPYTHON)
+   mesos_tests_DEPENDENCIES += $(EXAMPLESCRIPTSPYTHON)
+diff --git a/src/examples/python/test-containerizer.in b/src/examples/python/test-containerizer.in
+new file mode 100644
+index 0000000..569519b
+--- /dev/null
++++ b/src/examples/python/test-containerizer.in
+@@ -0,0 +1,47 @@
++#!/usr/bin/env bash
++
++# This script uses MESOS_SOURCE_DIR and MESOS_BUILD_DIR which come
++# from configuration substitutions.
++MESOS_SOURCE_DIR=@abs_top_srcdir@
++MESOS_BUILD_DIR=@abs_top_builddir@
++
++# Use colors for errors.
++. ${MESOS_SOURCE_DIR}/support/colors.sh
++
++# Force the use of the Python interpreter configured during building.
++test ! -z "${PYTHON}" && \
++  echo "${RED}Ignoring PYTHON environment variable (using @PYTHON@)${NORMAL}"
++
++PYTHON=@PYTHON@
++
++DISTRIBUTE_EGG=${MESOS_BUILD_DIR}/3rdparty/distribute-0.6.26/dist/
++DISTRIBUTE_EGG+=distribute-0.6.26@PYTHON_EGG_PUREPY_POSTFIX@.egg
++
++test ! -e ${DISTRIBUTE_EGG} && \
++  echo "${RED}Failed to find ${DISTRIBUTE_EGG}${NORMAL}" && \
++  exit 1
++
++PROTOBUF=${MESOS_BUILD_DIR}/3rdparty/libprocess/3rdparty/protobuf-2.5.0
++
++PROTOBUF_EGG=${PROTOBUF}/python/dist/
++PROTOBUF_EGG+=protobuf-2.5.0@PYTHON_EGG_PUREPY_POSTFIX@.egg
++
++test ! -e ${PROTOBUF_EGG} && \
++  echo "${RED}Failed to find ${PROTOBUF_EGG}${NORMAL}" && \
++  exit 1
++
++MESOS_EGG=${MESOS_BUILD_DIR}/src/python/dist/
++MESOS_EGG+=mesos-@PACKAGE_VERSION@@PYTHON_EGG_POSTFIX@.egg
++
++test ! -e ${MESOS_EGG} && \
++  echo "${RED}Failed to find ${MESOS_EGG}${NORMAL}" && \
++  exit 1
++
++SCRIPT=${MESOS_SOURCE_DIR}/src/examples/python/test_containerizer.py
++
++test ! -e ${SCRIPT} && \
++  echo "${RED}Failed to find ${SCRIPT}${NORMAL}" && \
++  exit 1
++
++PYTHONPATH="${DISTRIBUTE_EGG}:${MESOS_EGG}:${PROTOBUF_EGG}" \
++  exec ${PYTHON} ${SCRIPT} "${@}"
+diff --git a/src/examples/python/test_containerizer.py b/src/examples/python/test_containerizer.py
+new file mode 100755
+index 0000000..2c29a03
+--- /dev/null
++++ b/src/examples/python/test_containerizer.py
+@@ -0,0 +1,250 @@
++#!/usr/bin/env python
++
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# The scheme an external containerizer has to adhere to is;
++#
++# COMMAND (ADDITIONAL-PARAMETERS) < INPUT-PROTO > RESULT-PROTO
++#
++# launch (ContainerID) < ExternalTask > ExternalStatus
++# update (ContainerID) < ResourceArray > ExternalStatus
++# usage (ContainerID) > ResourceStatistics
++# wait (ContainerID) > Termination
++# destroy (ContainerID) > ExternalStatus
++#
++# NOTE: ExternalStatus is currently used for synchronizing and human
++# readable logging. The embedded message does not have to adhere to
++# any scheme but must not be empty for valid results.
++#
++# NOTE: After delivering a protobuf via stdout, that stream has to be
++# closed to signal a complete transmission.
++#
++# A complete implementations is only required for 'launch'. All other
++# command implementations may simply return a zero exit code and
++# thereby trigger a fall back for that specific command within Mesos.
++# See 'destroy' and 'wait' for examples of fall back implementation
++# triggers.
++# NOTE: 'update' does not have a fall back implementation and is
++# simply ignored if not implemented within the external containerizer
++# script.
++
++import os
++import subprocess
++import sys
++import struct
++
++import multiprocessing
++import time
++
++# Render a string describing how to use this script.
++def use(container, methods):
++    out = "Usage: %s <command> <container-id>\n" % container
++    out += "Valid commands: " + ', '.join(methods.keys())
++
++    return out
++
++
++# Read a data chunk prepended by its total size from stdin.
++def receive():
++    # Read size (size_t = unsigned long long => 8 bytes).
++    size = struct.unpack('Q', sys.stdin.read(8))
++    if size[0] <= 0:
++        print >> sys.stderr, "Expected protobuf size over stdin. " \
++                             "Received 0 bytes."
++        return ""
++
++    # Read payload.
++    data = sys.stdin.read(size[0])
++    if len(data) != size[0]:
++        print >> sys.stderr, "Expected %d bytes protobuf over stdin. " \
++                             "Received %d bytes." % (size[0], len(data))
++        return ""
++
++    return data
++
++
++# Write a protobuf message prepended by its total size to stdout.
++def send(data):
++    # Write size (unsigned long long = size_t).
++    os.write(1, struct.pack('Q', len(data)))
++
++    # Write payload.
++    os.write(1, data)
++
++
++# Start a containerized executor.
++# Expects to receive an ExternalTask protobuf via stdin and will deliver
++# an ExternalStatus protobuf via stdout when successful.
++def launch(container, arguments):
++    try:
++        data = receive()
++        if len(data) == 0:
++            return 1
++
++        external = mesos_pb2.ExternalTask()
++        external.ParseFromString(data)
++
++        if external.task.HasField("executor"):
++            command = ["sh",
++                       "-c",
++                       external.task.executor.command.value]
++        else:
++            print >> sys.stderr, "No executor passed; using mesos_executor!"
++            command = [external.mesos_executor_path,
++                       "sh",
++                       "-c",
++                       external.task.command.value]
++
++        proc = subprocess.Popen(command, env=os.environ.copy())
++
++        status = mesos_pb2.ExternalStatus();
++        status.message = "test-containerizer reports on launch."
++        status.pid = proc.pid
++
++        send(status.SerializeToString());
++
++    except google.protobuf.message.EncodeError:
++        print >> sys.stderr, "Could not serialise ExternalStatus protobuf."
++        return 1
++
++    except google.protobuf.message.DecodeError:
++        print >> sys.stderr, "Could not deserialise ExternalTask protobuf"
++        return 1
++
++    except OSError as e:
++        print >> sys.stderr, e.strerror
++        return 1
++
++    except ValueError:
++        print >> sys.stderr, "Value is invalid"
++        return 1
++
++    return 0
++
++
++# Update the container's resources.
++# Expects to receive a ResourceArray protobuf via stdin and will
++# deliver an ExternalStatus protobuf via stdout when successful.
++def update(container, arguments):
++    try:
++        data = receive()
++        if len(data) == 0:
++            return 1
++
++        resources = mesos_pb2.ResourceArray()
++        resources.ParseFromString(data)
++
++        print >> sys.stderr, "Received " + str(len(resources.resource)) \
++                           + " resource elements."
++
++        status = mesos_pb2.ExternalStatus();
++        status.message = "test-containerizer reports on update.";
++
++        send(status.SerializeToString());
++
++    except google.protobuf.message.EncodeError:
++        print >> sys.stderr, "Could not serialise ExternalStatus protobuf."
++        return 1
++
++    except google.protobuf.message.DecodeError:
++        print >> sys.stderr, "Could not deserialise ResourceArray protobuf."
++        return 1
++
++    except OSError as e:
++        print >> sys.stderr, e.strerror
++        return 1
++
++    except ValueError:
++        print >> sys.stderr, "Value is invalid"
++        return 1
++
++    return 0
++
++
++# Gather resource usage statistics for the containerized executor.
++# Delivers an ResourceStatistics protobut via stdout when
++# successful.
++def usage(container, arguments):
++    try:
++        statistics = mesos_pb2.ResourceStatistics();
++
++        statistics.timestamp = time.time();
++
++        # Cook up some fake data.
++        statistics.mem_rss_bytes = 1073741824;
++        statistics.mem_limit_bytes = 1073741824;
++        statistics.cpus_limit = 2;
++        statistics.cpus_user_time_secs = 0.12;
++        statistics.cpus_system_time_secs = 0.5;
++
++        send(statistics.SerializeToString());
++
++    except google.protobuf.message.EncodeError:
++        print >> sys.stderr, "Could not serialise ResourceStatistics protobuf."
++        return 1
++
++    except OSError as e:
++        print >> sys.stderr, e.strerror
++        return 1
++
++    return 0
++
++
++# Terminate the containerized executor.
++# A complete implementation would deliver an ExternalStatus protobuf
++# when succesful.
++def destroy(container, arguments):
++    return 0
++
++
++# Get the containerized executor's Termination.
++# A complete implementation would deliver a Termination protobuf
++# filled with the information gathered from launch's waitpid via
++# stdout.
++def wait(container, arguments):
++    return 0
++
++
++if __name__ == "__main__":
++    methods = { "launch":  launch,
++                "update":  update,
++                "destroy": destroy,
++                "usage":   usage,
++                "wait":    wait }
++
++    if sys.argv[1:2] == ["--help"] or sys.argv[1:2] == ["-h"]:
++        print use(sys.argv[0], methods)
++        sys.exit(0)
++
++    if len(sys.argv) < 3:
++        print >> sys.stderr, "Please pass a command and a container-id"
++        print >> sys.stderr, use(sys.argv[0], methods)
++        sys.exit(1)
++
++    command = sys.argv[1]
++    if command not in methods:
++        print >> sys.stderr, "No valid command passed"
++        print >> sys.stderr, use(sys.argv[0], methods)
++        sys.exit(2)
++
++    method = methods.get(command)
++
++    import mesos
++    import mesos_pb2
++    import google
++
++    sys.exit(method(sys.argv[2], sys.argv[3:]))
+diff --git a/src/slave/containerizer/containerizer.cpp b/src/slave/containerizer/containerizer.cpp
+index 344872a..9321bbd 100644
+--- a/src/slave/containerizer/containerizer.cpp
++++ b/src/slave/containerizer/containerizer.cpp
+@@ -38,6 +38,7 @@
+ #include "slave/containerizer/isolator.hpp"
+ #include "slave/containerizer/launcher.hpp"
+ #include "slave/containerizer/mesos_containerizer.hpp"
++#include "slave/containerizer/external_containerizer.hpp"
+ 
+ #include "slave/containerizer/isolators/posix.hpp"
+ #ifdef __linux__
+@@ -176,6 +177,10 @@ Try<Containerizer*> Containerizer::create(
+ 
+   LOG(INFO) << "Using isolation: " << isolation;
+ 
++  if (isolation == "external") {
++    return new ExternalContainerizer(flags);
++  }
++
+   // Create a MesosContainerizerProcess using isolators and a launcher.
+   hashmap<std::string, Try<Isolator*> (*)(const Flags&)> creators;
+ 
+diff --git a/src/slave/containerizer/external_containerizer.hpp b/src/slave/containerizer/external_containerizer.hpp
+new file mode 100644
+index 0000000..1a6ca3f
+--- /dev/null
++++ b/src/slave/containerizer/external_containerizer.hpp
+@@ -0,0 +1,260 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef __EXTERNAL_CONTAINERIZER_HPP__
++#define __EXTERNAL_CONTAINERIZER_HPP__
++
++#include <list>
++#include <sstream>
++#include <string>
++
++#include <process/owned.hpp>
++#include <process/subprocess.hpp>
++
++#include <stout/hashmap.hpp>
++#include <stout/try.hpp>
++#include <stout/tuple.hpp>
++
++#include "slave/containerizer/containerizer.hpp"
++#include "slave/containerizer/isolator.hpp"
++#include "slave/containerizer/launcher.hpp"
++
++namespace mesos {
++namespace internal {
++namespace slave {
++
++// The scheme an external containerizer has to adhere to is;
++//
++// COMMAND (ADDITIONAL-PARAMETERS) < INPUT-PROTO > RESULT-PROTO
++//
++// launch (ContainerID) < ExternalTask > ExternalStatus
++// update (ContainerID) < ResourceArray > ExternalStatus
++// usage (ContainerID) > ResourceStatistics
++// wait (ContainerID) > Termination
++// destroy (ContainerID) > ExternalStatus
++//
++// NOTE: ExternalStatus is currently used for synchronizing and human
++// readable logging. The embedded message does not have to adhere to
++// any scheme but must not be empty for valid results.
++
++// For debugging purposes of an external containerizer, it might be
++// helpful to enable verbose logging on the slave (GLOG_v=2).
++
++class ExternalContainerizerProcess;
++
++class ExternalContainerizer : public Containerizer
++{
++public:
++  ExternalContainerizer(const Flags& flags);
++
++  virtual ~ExternalContainerizer();
++
++  virtual process::Future<Nothing> recover(
++      const Option<state::SlaveState>& state);
++
++  virtual process::Future<ExecutorInfo> launch(
++      const ContainerID& containerId,
++      const TaskInfo& task,
++      const FrameworkID& frameworkId,
++      const std::string& directory,
++      const Option<std::string>& user,
++      const SlaveID& slaveId,
++      const process::PID<Slave>& slavePid,
++      bool checkpoint);
++
++  virtual process::Future<Nothing> update(
++      const ContainerID& containerId,
++      const Resources& resources);
++
++  virtual process::Future<ResourceStatistics> usage(
++      const ContainerID& containerId);
++
++  virtual process::Future<Termination> wait(const ContainerID& containerId);
++
++  virtual void destroy(const ContainerID& containerId);
++
++private:
++  ExternalContainerizerProcess* process;
++};
++
++
++class ExternalContainerizerProcess
++  : public process::Process<ExternalContainerizerProcess>
++{
++public:
++  ExternalContainerizerProcess(const Flags& flags);
++
++  // Recover containerized executors as specified by state. See
++  // containerizer.hpp:recover for more.
++  process::Future<Nothing> recover(const Option<state::SlaveState>& state);
++
++  // Start the containerized executor.
++  process::Future<ExecutorInfo> launch(
++      const ContainerID& containerId,
++      const TaskInfo& task,
++      const FrameworkID& frameworkId,
++      const std::string& directory,
++      const Option<std::string>& user,
++      const SlaveID& slaveId,
++      const process::PID<Slave>& slavePid,
++      bool checkpoint);
++
++  // Update the container's resources.
++  process::Future<Nothing> update(
++      const ContainerID& containerId,
++      const Resources& resources);
++
++  // Gather resource usage statistics for the containerized executor.
++  process::Future<ResourceStatistics> usage(const ContainerID& containerId);
++
++  // Get a future on the containerized executor's Termination.
++  process::Future<Termination> wait(const ContainerID& containerId);
++
++  // Terminate the containerized executor.
++  void destroy(const ContainerID& containerId);
++
++private:
++  // Startup flags.
++  const Flags flags;
++
++  // Wraps futures of both, the result (protobuf-message) and the
++  // command's exit-code of the external containerizer. A tuple is
++  // used, so it can directly feed into the process::await-tuple-
++  // overload.
++  typedef tuples::tuple<
++      process::Future<std::string>,
++      process::Future<Option<int> > > ResultFutures;
++
++  // Information describing a running container.
++  struct Container
++  {
++    Container(pid_t containerPid)
++      : containerPid(containerPid) {}
++
++    // External containerizer pid.
++    const pid_t containerPid;
++
++    // Containerized executor pid. This is an option as the external
++    // containerizer might fail to transmit it on 'launch'.
++    Option<pid_t> pid;
++
++    process::Promise<Termination> termination;
++    process::Promise<bool> waited;
++
++    Resources resources;
++  };
++
++  // Stores all launched processes.
++  hashmap<ContainerID, process::Owned<Container> > containers;
++
++  // Information describing a container environment. A sandbox has to
++  // be prepared before the external containerizer can be invoked.
++  // As the Container struct is populated after the 'launch'
++  // invocation, bundling this information with the above would
++  // trigger additionl state check overhead.
++  struct Sandbox
++  {
++    Sandbox(const std::string& directory, const Option<std::string>& user)
++      : directory(directory), user(user) {}
++
++    const std::string directory;
++    const Option<std::string> user;
++  };
++
++  // Stores sandbox specific information.
++  hashmap<ContainerID, process::Owned<Sandbox> > sandboxes;
++
++  process::Future<ExecutorInfo> _launch(
++      const ContainerID& containerId,
++      const FrameworkID& frameworkId,
++      const ExecutorInfo executorInfo,
++      const SlaveID& slaveId,
++      bool checkpoint,
++      const process::Future<ResultFutures>& future);
++
++  void _wait(
++      const ContainerID& containerId,
++      const process::Future<ResultFutures>& future);
++
++  process::Future<Nothing> _update(
++      const ContainerID& containerId,
++      const process::Future<ResultFutures>& future);
++
++  process::Future<ResourceStatistics> _usage(
++      const ContainerID& containerId,
++      const process::Future<ResultFutures>& future);
++
++  void _destroy(
++      const ContainerID& containerId,
++      const process::Future<ResultFutures>& future);
++
++  // Call back for when the pluggable containerizer process status has
++  // changed.
++  void reaped(const ContainerID& containerId,
++      const process::Future<Option<int> >& status);
++
++  // If the exit code is 0 and the data sent on stdout is empty,
++  // it is taken to mean that the external containerizer is
++  // requesting Mesos use the default strategy for a particular
++  // method (usage, wait, and all the rest). Should the external
++  // containerizer exit non-zero, it is always an error. Data
++  // received is exposed via result.
++  Try<bool> commandSupported(
++      const process::Future<ResultFutures>& future,
++      std::string& result);
++
++  // Sets the pipe in non-blocking mode and reads a size prefixed
++  // chunk of data into a string.
++  process::Future<std::string> read(int pipe);
++
++  // Terminate a containerizer process and its children, sends a
++  // SIGKILL.
++  // TODO(tillt): Add graceful termination as soon as we have
++  // an accepted way to do that in place.
++  void terminate(const ContainerID& containerId);
++
++  // Call back for when the containerizer has terminated all processes
++  // in the container.
++  void cleanup(const ContainerID& containerId);
++
++  Try<process::Subprocess> invoke(
++      const std::string& command,
++      const ContainerID& containerId,
++      const std::string& output
++        = std::string(),
++      const std::map<std::string, std::string>& environment
++        = std::map<std::string, std::string>());
++};
++
++
++// Get an ExecutorInfo that is specific to a container.
++ExecutorInfo containerExecutorInfo(
++    const Flags& flags,
++    const TaskInfo& task,
++    const FrameworkID& frameworkId);
++
++
++// Get a human readable error string from an initialization error of a
++// protobuf message.
++std::string protobufError(const google::protobuf::Message& message);
++
++} // namespace slave {
++} // namespace internal {
++} // namespace mesos {
++
++#endif // __EXTERNAL_CONTAINERIZER_HPP__
+diff --git a/src/slave/containerizer/external_containerizer.cpp b/src/slave/containerizer/external_containerizer.cpp
+new file mode 100644
+index 0000000..a63308c
+--- /dev/null
++++ b/src/slave/containerizer/external_containerizer.cpp
+@@ -0,0 +1,1203 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <iostream>
++#include <iomanip>
++#include <list>
++
++#include <errno.h>
++#include <poll.h>
++#include <signal.h>
++#include <stdio.h>
++
++#include <boost/shared_array.hpp>
++
++#include <process/collect.hpp>
++#include <process/defer.hpp>
++#include <process/delay.hpp>
++#include <process/id.hpp>
++#include <process/io.hpp>
++#include <process/reap.hpp>
++
++#include <stout/check.hpp>
++#include <stout/foreach.hpp>
++#include <stout/lambda.hpp>
++#include <stout/nothing.hpp>
++#include <stout/option.hpp>
++#include <stout/os.hpp>
++#include <stout/strings.hpp>
++#include <stout/uuid.hpp>
++
++#include "common/type_utils.hpp"
++
++#include "slave/paths.hpp"
++
++#include "slave/containerizer/external_containerizer.hpp"
++
++// Process user environment.
++extern char** environ;
++
++using lambda::bind;
++using std::list;
++using std::map;
++using std::set;
++using std::string;
++using std::stringstream;
++using std::vector;
++using tuples::tuple;
++
++using namespace process;
++
++namespace mesos {
++namespace internal {
++namespace slave {
++
++using state::ExecutorState;
++using state::FrameworkState;
++using state::RunState;
++using state::SlaveState;
++
++
++ExternalContainerizer::ExternalContainerizer(const Flags& flags)
++{
++  process = new ExternalContainerizerProcess(flags);
++  spawn(process);
++}
++
++
++ExternalContainerizer::~ExternalContainerizer()
++{
++  terminate(process);
++  process::wait(process);
++  delete process;
++}
++
++
++Future<Nothing> ExternalContainerizer::recover(
++    const Option<state::SlaveState>& state)
++{
++  return dispatch(process, &ExternalContainerizerProcess::recover, state);
++}
++
++
++Future<ExecutorInfo> ExternalContainerizer::launch(
++    const ContainerID& containerId,
++    const TaskInfo& taskInfo,
++    const FrameworkID& frameworkId,
++    const string& directory,
++    const Option<string>& user,
++    const SlaveID& slaveId,
++    const PID<Slave>& slavePid,
++    bool checkpoint)
++{
++  return dispatch(process,
++                  &ExternalContainerizerProcess::launch,
++                  containerId,
++                  taskInfo,
++                  frameworkId,
++                  directory,
++                  user,
++                  slaveId,
++                  slavePid,
++                  checkpoint);
++}
++
++
++Future<Nothing> ExternalContainerizer::update(
++    const ContainerID& containerId,
++    const Resources& resources)
++{
++  return dispatch(process,
++                  &ExternalContainerizerProcess::update,
++                  containerId,
++                  resources);
++}
++
++
++Future<ResourceStatistics> ExternalContainerizer::usage(
++    const ContainerID& containerId)
++{
++  return dispatch(process, &ExternalContainerizerProcess::usage, containerId);
++}
++
++
++Future<Termination> ExternalContainerizer::wait(
++    const ContainerID& containerId)
++{
++  return dispatch(process, &ExternalContainerizerProcess::wait, containerId);
++}
++
++
++void ExternalContainerizer::destroy(const ContainerID& containerId)
++{
++  dispatch(process, &ExternalContainerizerProcess::destroy, containerId);
++}
++
++
++ExternalContainerizerProcess::ExternalContainerizerProcess(
++    const Flags& _flags) : flags(_flags) {}
++
++
++Future<Nothing> ExternalContainerizerProcess::recover(
++    const Option<state::SlaveState>& state)
++{
++  // Filter the executor run states that we attempt to recover and do
++  // so.
++  if (state.isSome()) {
++    foreachvalue (const FrameworkState& framework, state.get().frameworks) {
++      foreachvalue (const ExecutorState& executor, framework.executors) {
++        LOG(INFO) << "Recovering executor '" << executor.id
++                  << "' of framework " << framework.id;
++
++        if (executor.info.isNone()) {
++          LOG(WARNING) << "Skipping recovery of executor '" << executor.id
++                       << "' of framework " << framework.id
++                       << " because its info could not be recovered";
++          continue;
++        }
++
++        if (executor.latest.isNone()) {
++          LOG(WARNING) << "Skipping recovery of executor '" << executor.id
++                       << "' of framework " << framework.id
++                       << " because its latest run could not be recovered";
++          continue;
++        }
++
++        // We are only interested in the latest run of the executor!
++        const ContainerID& containerId = executor.latest.get();
++        Option<RunState> run = executor.runs.get(containerId);
++        CHECK_SOME(run);
++
++        // We need the pid so the reaper can monitor the executor so skip this
++        // executor if it's not present. This is not an error because the slave
++        // will try to wait on the container which will return a failed
++        // Termination and everything will get cleaned up.
++        if (!run.get().forkedPid.isSome()) {
++          continue;
++        }
++
++        if (run.get().completed) {
++          LOG(INFO) << "Skipping recovery of executor '" << executor.id
++                    << "' of framework " << framework.id
++                    << " because its latest run '" << containerId << "'"
++                    << " is completed";
++          continue;
++        }
++
++        const pid_t pid(run.get().forkedPid.get());
++        containers.put(containerId, Owned<Container>(new Container(pid)));
++
++        process::reap(pid)
++          .onAny(defer(
++            PID<ExternalContainerizerProcess>(this),
++            &ExternalContainerizerProcess::reaped,
++            containerId,
++            lambda::_1));
++
++        // Recreate the sandbox information.
++        // TODO (tillt): This recreates logic that is supposed to be
++        // further up, within the slave implementation.
++        const string& directory = paths::createExecutorDirectory(
++          flags.work_dir,
++          state.get().id,
++          framework.id,
++          executor.id,
++          containerId);
++
++        CHECK(framework.info.isSome());
++
++        const Option<string>& user = flags.switch_user
++          ? Option<string>(framework.info.get().user()) : None();
++
++        sandboxes.put(
++          containerId,
++          Owned<Sandbox>(new Sandbox(directory, user)));
++      }
++    }
++  }
++
++  return Nothing();
++}
++
++
++Future<ExecutorInfo> ExternalContainerizerProcess::launch(
++    const ContainerID& containerId,
++    const TaskInfo& taskInfo,
++    const FrameworkID& frameworkId,
++    const std::string& directory,
++    const Option<std::string>& user,
++    const SlaveID& slaveId,
++    const PID<Slave>& slavePid,
++    bool checkpoint)
++{
++  LOG(INFO) << "Launching container '" << containerId << "'";
++
++  // Get the executor from our task. If no executor is associated with
++  // the given task, this function renders an ExecutorInfo using the
++  // mesos-executor as its command.
++  ExecutorInfo executor = containerExecutorInfo(flags, taskInfo, frameworkId);
++  executor.mutable_resources()->MergeFrom(taskInfo.resources());
++
++  if (containers.contains(containerId)) {
++    return Failure("Cannot start already running container '"
++      + containerId.value() + "'");
++  }
++
++  sandboxes.put(containerId, Owned<Sandbox>(new Sandbox(directory, user)));
++
++  map<string, string> environment = executorEnvironment(
++      executor,
++      directory,
++      slaveId,
++      slavePid,
++      checkpoint,
++      flags.recovery_timeout);
++
++  if (!flags.hadoop_home.empty()) {
++    environment["HADOOP_HOME"] = flags.hadoop_home;
++  }
++
++  TaskInfo task;
++  task.CopyFrom(taskInfo);
++  CommandInfo* command = task.has_executor()
++    ? task.mutable_executor()->mutable_command()
++    : task.mutable_command();
++  // When the selected command has no container attached, use the
++  // default from the slave startup flags, if available.
++  if (!command->has_container()) {
++    if (flags.default_container_image.isSome()) {
++      command->mutable_container()->set_image(
++          flags.default_container_image.get());
++    } else {
++      LOG(INFO) << "No container specified in task and no default given. "
++                << "The external containerizer will have to fill in "
++                << "defaults.";
++    }
++  }
++
++  ExternalTask external;
++  external.mutable_task()->CopyFrom(task);
++  external.set_mesos_executor_path(
++      path::join(flags.launcher_dir, "mesos-executor"));
++
++  stringstream output;
++  external.SerializeToOstream(&output);
++
++  Try<Subprocess> invoked = invoke(
++      "launch",
++      containerId,
++      output.str(),
++      environment);
++
++  if (invoked.isError()) {
++    return Failure("Launch of container '" + containerId.value()
++      + "' failed (error: " + invoked.error() + ")");
++  }
++
++  // Record the process.
++  containers.put(
++      containerId,
++      Owned<Container>(new Container(invoked.get().pid())));
++
++  VLOG(2) << "Now awaiting data from pipe...";
++
++  // Read from the result-pipe and invoke callbacks when reaching EOF.
++  return await(read(invoked.get().out()), invoked.get().status())
++    .then(defer(
++        PID<ExternalContainerizerProcess>(this),
++        &ExternalContainerizerProcess::_launch,
++        containerId,
++        frameworkId,
++        executor,
++        slaveId,
++        checkpoint,
++        lambda::_1));
++}
++
++
++Future<ExecutorInfo> ExternalContainerizerProcess::_launch(
++    const ContainerID& containerId,
++    const FrameworkID& frameworkId,
++    const ExecutorInfo executorInfo,
++    const SlaveID& slaveId,
++    bool checkpoint,
++    const Future<ResultFutures>& future)
++{
++  VLOG(1) << "Launch callback triggered on container '" << containerId << "'";
++
++  if (!containers.contains(containerId)) {
++    return Failure("Container '" + containerId.value() + "' not running");
++  }
++
++  string result;
++  Try<bool> support = commandSupported(future, result);
++  if (support.isError()) {
++    terminate(containerId);
++    return Failure(support.error());
++  }
++
++  if (!support.get()) {
++    // We generally need to use an internal implementation in these
++    // cases.
++    // For the specific case of a launch however, there can not be an
++    // internal implementation for a external containerizer, hence
++    // we need to fail or even abort at this point.
++    // TODO(tillt): Consider using posix-isolator as a fall back.
++    terminate(containerId);
++    return Failure("External containerizer does not support launch");
++  }
++
++  VLOG(1) << "Launch supported by external containerizer";
++
++  ExternalStatus ps;
++  if (!ps.ParseFromString(result)) {
++    // TODO(tillt): Consider not terminating the containerizer due
++    // to protocol breach but only fail the operation.
++    terminate(containerId);
++    return Failure("Could not parse launch result protobuf (error: "
++      + protobufError(ps) + ")");
++  }
++
++  VLOG(2) << "Launch result: '" << ps.message() << "'";
++  VLOG(2) << "Executor pid: " << ps.pid();
++
++  containers[containerId]->pid = ps.pid();
++
++  // Observe the executor process and install a callback for status
++  // changes.
++  process::reap(ps.pid())
++    .onAny(defer(
++        PID<ExternalContainerizerProcess>(this),
++        &ExternalContainerizerProcess::reaped,
++        containerId,
++        lambda::_1));
++
++  // Checkpoint the container's pid if requested.
++  if (checkpoint) {
++    const string& path = slave::paths::getForkedPidPath(
++        slave::paths::getMetaRootDir(flags.work_dir),
++        slaveId,
++        frameworkId,
++        executorInfo.executor_id(),
++        containerId);
++
++    LOG(INFO) << "Checkpointing containerized executor '" << containerId
++              << "' pid " << ps.pid() << " to '" << path <<  "'";
++
++    Try<Nothing> checkpointed =
++        slave::state::checkpoint(path, stringify(ps.pid()));
++
++    if (checkpointed.isError()) {
++      terminate(containerId);
++      return Failure("Failed to checkpoint containerized executor '"
++        + containerId.value() + "' pid " + stringify(ps.pid()) + " to '" + path
++        + "'");
++    }
++  }
++
++  VLOG(1) << "Launch finishing up for container '" << containerId << "'";
++  return executorInfo;
++}
++
++
++Future<Termination> ExternalContainerizerProcess::wait(
++    const ContainerID& containerId)
++{
++  VLOG(1) << "Wait triggered on container '" << containerId << "'";
++
++  if (!containers.contains(containerId)) {
++    LOG(ERROR) << "not running";
++    return Failure("Container '" + containerId.value() + "' not running");
++  }
++
++  Try<Subprocess> invoked = invoke("wait", containerId);
++
++  if (invoked.isError()) {
++    LOG(ERROR) << "not running";
++    terminate(containerId);
++    return Failure("Wait on container '" + containerId.value()
++      + "' failed (error: " + invoked.error() + ")");
++  }
++
++  // Await both, input from the pipe as well as an exit of the
++  // process.
++  await(read(invoked.get().out()), invoked.get().status())
++    .onAny(defer(
++        PID<ExternalContainerizerProcess>(this),
++        &ExternalContainerizerProcess::_wait,
++        containerId,
++        lambda::_1));
++
++  return containers[containerId]->termination.future();
++}
++
++
++void ExternalContainerizerProcess::_wait(
++    const ContainerID& containerId,
++    const Future<ResultFutures>& future)
++{
++  VLOG(1) << "Wait callback triggered on container '" << containerId << "'";
++
++  if (!containers.contains(containerId)) {
++    LOG(ERROR) << "Container '" << containerId << "' not running";
++    return;
++  }
++
++  Owned<Container> container = containers[containerId];
++
++  string result;
++  Try<bool> support = commandSupported(future, result);
++  if (support.isError()) {
++    container->termination.fail(support.error());
++    return;
++  }
++
++  // Final clean up is delayed until someone has waited on the
++  // container so set the future to indicate this has occurred.
++  if (!container->waited.future().isReady()) {
++    container->waited.set(true);
++  }
++
++  if (support.get()) {
++    VLOG(1) << "Wait supported by external containerizer";
++
++    Termination termination;
++    if (!termination.ParseFromString(result)) {
++      // TODO(tillt): Consider not terminating the containerizer due
++      // to protocol breach but only fail the operation.
++      container->termination.fail(
++          "Could not parse wait result protobuf (error: "
++          + protobufError(termination) + ")");
++      return;
++    }
++
++    VLOG(2) << "Wait result: '" << termination.DebugString() << "'";
++
++    // Satisfy the promise with the termination information we got
++    // from the external containerizer
++    container->termination.set(termination);
++
++    return;
++  }
++  VLOG(1) << "Wait requests default implementation";
++}
++
++
++Future<Nothing> ExternalContainerizerProcess::update(
++    const ContainerID& containerId,
++    const Resources& resources)
++{
++  VLOG(1) << "Update triggered on container '" << containerId << "'";
++
++  if (!containers.contains(containerId)) {
++    return Failure("Container '" + containerId.value() + "'' not running");
++  }
++
++  containers[containerId]->resources = resources;
++
++  // Wrap the Resource protobufs into a ResourceArray protobuf to
++  // avoid any problems with streamed protobufs.
++  // See http://goo.gl/d1x14F for more on that issue.
++  ResourceArray resourceArray;
++  foreach (const Resource& r, resources) {
++    Resource *resource = resourceArray.add_resource();
++    resource->CopyFrom(r);
++  }
++
++  stringstream output;
++  resourceArray.SerializeToOstream(&output);
++
++  Try<Subprocess> invoked = invoke("update", containerId, output.str());
++
++  if (invoked.isError()) {
++    terminate(containerId);
++    return Failure("Update of container '" + containerId.value()
++      + "' failed (error: " + invoked.error() + ")");
++  }
++
++  // Await both, input from the pipe as well as an exit of the
++  // process.
++  return await(read(invoked.get().out()), invoked.get().status())
++    .then(defer(
++        PID<ExternalContainerizerProcess>(this),
++        &ExternalContainerizerProcess::_update,
++        containerId,
++        lambda::_1));
++}
++
++
++Future<Nothing> ExternalContainerizerProcess::_update(
++    const ContainerID& containerId,
++    const Future<ResultFutures>& future)
++{
++  VLOG(1) << "Update callback triggered on container '" << containerId << "'";
++
++  if (!containers.contains(containerId)) {
++    return Failure("Container '" + containerId.value() + "' not running");
++  }
++
++  string result;
++  Try<bool> support = commandSupported(future, result);
++  if (support.isError()) {
++    terminate(containerId);
++    return Failure(support.error());
++  }
++
++  if (support.get()) {
++    VLOG(1) << "Update supported by external containerizer";
++
++    ExternalStatus ps;
++    if (!ps.ParseFromString(result)) {
++      // TODO(tillt): Consider not terminating the containerizer due
++      // to protocol breach but only fail the operation.
++      terminate(containerId);
++      return Failure("Could not parse update result protobuf (error: "
++        + protobufError(ps) + ")");
++    }
++
++    VLOG(2) << "Update result: '" << ps.message() << "'";
++
++    return Nothing();
++  }
++
++  VLOG(1) << "Update requests default implementation";
++  LOG(INFO) << "Update ignoring updates as the external containerizer does"
++            << "not support it";
++
++  return Nothing();
++}
++
++
++Future<ResourceStatistics> ExternalContainerizerProcess::usage(
++    const ContainerID& containerId)
++{
++  VLOG(1) << "Usage triggered on container '" << containerId << "'";
++
++  if (!containers.contains(containerId)) {
++    return Failure("Container '" + containerId.value() + "'' not running");
++  }
++
++  Try<Subprocess> invoked = invoke("usage", containerId);
++
++  if (invoked.isError()) {
++    terminate(containerId);
++    return Failure("Usage on container '" + containerId.value()
++      + "' failed (error: " + invoked.error() + ")");
++  }
++
++  // Await both, input from the pipe as well as an exit of the
++  // process.
++  return await(read(invoked.get().out()), invoked.get().status())
++    .then(defer(
++        PID<ExternalContainerizerProcess>(this),
++        &ExternalContainerizerProcess::_usage,
++        containerId,
++        lambda::_1));
++}
++
++
++Future<ResourceStatistics> ExternalContainerizerProcess::_usage(
++    const ContainerID& containerId,
++    const Future<ResultFutures>& future)
++{
++  VLOG(1) << "Usage callback triggered on container '" << containerId << "'";
++
++  if (!containers.contains(containerId)) {
++    return Failure("Container '" + containerId.value() + "' not running");
++  }
++
++  string result;
++  Try<bool> support = commandSupported(future, result);
++  if (support.isError()) {
++    terminate(containerId);
++    return Failure(support.error());
++  }
++
++  ResourceStatistics statistics;
++
++  if (!support.get()) {
++    VLOG(1) << "Usage requests default implementation";
++
++    if (containers[containerId]->pid.isNone()) {
++      return Failure("Executor for containerizer '" + containerId.value()
++                   + "' not running");
++    }
++
++    pid_t pid = containers[containerId]->pid.get();
++
++    Result<os::Process> process = os::process(pid);
++
++    if (!process.isSome()) {
++      return Failure(process.isError()
++        ? process.error()
++        : "Process does not exist or may have terminated already");
++    }
++
++    statistics.set_timestamp(Clock::now().secs());
++
++    // Set the resource allocations.
++    // TODO(idownes): After recovery resources won't be known until
++    // after an update() because they aren't part of the SlaveState.
++    const Resources& resources = containers[containerId]->resources;
++    const Option<Bytes>& mem = resources.mem();
++    if (mem.isSome()) {
++      statistics.set_mem_limit_bytes(mem.get().bytes());
++    }
++
++    const Option<double>& cpus = resources.cpus();
++    if (cpus.isSome()) {
++      statistics.set_cpus_limit(cpus.get());
++    }
++
++    if (process.get().rss.isSome()) {
++      statistics.set_mem_rss_bytes(process.get().rss.get().bytes());
++    }
++
++    // We only show utime and stime when both are available, otherwise
++    // we're exposing a partial view of the CPU times.
++    if (process.get().utime.isSome() && process.get().stime.isSome()) {
++      statistics.set_cpus_user_time_secs(process.get().utime.get().secs());
++      statistics.set_cpus_system_time_secs(process.get().stime.get().secs());
++    }
++
++    // Now aggregate all descendant process usage statistics.
++    const Try<set<pid_t> >& children = os::children(pid, true);
++
++    if (children.isError()) {
++      return Failure("Failed to get children of "
++        + stringify(pid) + ": " + children.error());
++    }
++
++    // Aggregate the usage of all child processes.
++    foreach (pid_t child, children.get()) {
++      process = os::process(child);
++
++      // Skip processes that disappear.
++      if (process.isNone()) {
++        continue;
++      }
++
++      if (process.isError()) {
++        LOG(WARNING) << "Failed to get status of descendant process " << child
++                     << " of parent " << pid << ": "
++                     << process.error();
++        continue;
++      }
++
++      if (process.get().rss.isSome()) {
++        statistics.set_mem_rss_bytes(
++            statistics.mem_rss_bytes() + process.get().rss.get().bytes());
++      }
++
++      // We only show utime and stime when both are available,
++      // otherwise we're exposing a partial view of the CPU times.
++      if (process.get().utime.isSome() && process.get().stime.isSome()) {
++        statistics.set_cpus_user_time_secs(
++            statistics.cpus_user_time_secs()
++              + process.get().utime.get().secs());
++        statistics.set_cpus_system_time_secs(
++            statistics.cpus_system_time_secs()
++              + process.get().stime.get().secs());
++      }
++    }
++  } else {
++    VLOG(1) << "Usage supported by external containerizer";
++
++    if (!statistics.ParseFromString(result)) {
++      // TODO(tillt): Consider not terminating the containerizer due
++      // to protocol breach but only fail the operation.
++      terminate(containerId);
++      return Failure("Could not parse usage result protobuf (error: "
++        + protobufError(statistics) + ")");
++    }
++
++    VLOG(2) << "Usage result: '" << statistics.DebugString() << "'";
++  }
++
++  LOG(INFO) << "containerId '" << containerId << "' "
++            << "total mem usage "
++            << statistics.mem_rss_bytes() << " "
++            << "total CPU user usage "
++            << statistics.cpus_user_time_secs() << " "
++            << "total CPU system usage "
++            << statistics.cpus_system_time_secs();
++
++  return statistics;
++}
++
++
++void ExternalContainerizerProcess::destroy(const ContainerID& containerId)
++{
++  VLOG(1) << "Destroy triggered on container '" << containerId << "'";
++
++  if (!containers.contains(containerId)) {
++    LOG(ERROR) << "Container '" << containerId << "' not running";
++    return;
++  }
++
++  Try<Subprocess> invoked = invoke("destroy", containerId);
++
++  if (invoked.isError()) {
++    LOG(ERROR) << "Destroy of container '" << containerId
++               << "' failed (error: " << invoked.error() << ")";
++    terminate(containerId);
++    return;
++  }
++
++  // Await both, input from the pipe as well as an exit of the
++  // process.
++  await(read(invoked.get().out()), invoked.get().status())
++    .onAny(defer(
++        PID<ExternalContainerizerProcess>(this),
++        &ExternalContainerizerProcess::_destroy,
++        containerId,
++        lambda::_1));
++}
++
++
++void ExternalContainerizerProcess::_destroy(
++    const ContainerID& containerId,
++    const Future<ResultFutures>& future)
++{
++  VLOG(1) << "Destroy callback triggered on container '" << containerId << "'";
++
++  if (!containers.contains(containerId)) {
++    LOG(ERROR) << "Container '" << containerId.value() << "' not running";
++    return;
++  }
++
++  string result;
++  Try<bool> support = commandSupported(future, result);
++
++  if (!support.isError()) {
++    if (support.get()) {
++      VLOG(1) << "Destroy supported by external containerizer";
++
++      ExternalStatus ps;
++      if (!ps.ParseFromString(result)) {
++        LOG(ERROR) << "Could not parse update result protobuf (error: "
++                   << protobufError(ps) << ")";
++        // Continue regular program flow as we need to kill the
++        // containerizer process.
++      }
++      VLOG(2) << "Destroy result: '" << ps.message() << "'";
++    } else {
++      VLOG(1) << "Destroy requests default implementation";
++    }
++  }
++
++  // Additionally to the optional external destroy-command, we need to
++  // terminate the external containerizer's process.
++  terminate(containerId);
++}
++
++
++void ExternalContainerizerProcess::reaped(
++    const ContainerID& containerId,
++    const Future<Option<int> >& status)
++{
++  if (!containers.contains(containerId)) {
++    LOG(WARNING) << "Container '" << containerId << "' not running";
++    return;
++  }
++
++  VLOG(2) << "status-future on containerId '" << containerId
++          << "' has reached: "
++          << (status.isReady() ? "READY" :
++             status.isFailed() ? "FAILED: " + status.failure() :
++             "DISCARDED");
++
++  Future<Termination> future;
++  if (!status.isReady()) {
++    // Something has gone wrong, probably an unsuccessful terminate().
++    future = Failure(
++        "Failed to get status: " +
++        (status.isFailed() ? status.failure() : "discarded"));
++  } else {
++    LOG(INFO) << "Container '" << containerId << "' "
++              << "has terminated with "
++              << (status.get().isSome() ?
++                  "exit-code: " + stringify(status.get().get()) :
++                  "no result");
++    Termination termination;
++    termination.set_killed(false);
++    termination.set_message("Containerizer terminated");
++    if (status.get().isSome()) {
++      termination.set_status(status.get().get());
++    }
++    future = termination;
++  }
++
++  // Set the promise to alert others waiting on this container.
++  containers[containerId]->termination.set(future);
++
++  // Ensure someone notices this termination by deferring final clean
++  // up until the container has been waited on.
++  containers[containerId]->waited.future()
++    .onAny(defer(PID<ExternalContainerizerProcess>(this),
++                 &ExternalContainerizerProcess::cleanup,
++                 containerId));
++}
++
++
++void ExternalContainerizerProcess::cleanup(
++    const ContainerID& containerId)
++{
++  VLOG(1) << "Callback performing final cleanup of running state";
++
++  if (sandboxes.contains(containerId)) {
++    sandboxes.erase(containerId);
++  } else {
++    LOG(WARNING) << "Container '" << containerId << "' not sandboxed";
++  }
++
++  if (containers.contains(containerId)) {
++    containers.erase(containerId);
++  } else {
++    LOG(WARNING) << "Container '" << containerId << "' not running anymore";
++  }
++}
++
++
++void ExternalContainerizerProcess::terminate(const ContainerID& containerId)
++{
++  if (!containers.contains(containerId)) {
++    LOG(WARNING) << "Container '" << containerId << "' not running";
++    return;
++  }
++
++  if (containers[containerId]->pid.isNone()) {
++    LOG(WARNING) << "Ignoring executor termination for container '"
++                 << containerId << "' as it was not launched success";
++    return;
++  }
++
++  // Terminate the executor.
++  pid_t pid = containers[containerId]->pid.get();
++  VLOG(2) << "About to send a SIGKILL to executor pid: " << pid;
++
++  // TODO(tillt): Add graceful termination as soon as we have an
++  // accepted way to do that in place.
++  Try<list<os::ProcessTree> > trees =
++    os::killtree(pid, SIGKILL, true, true);
++
++  if (trees.isError()) {
++    LOG(WARNING) << "Failed to kill the process tree rooted at pid "
++                 << pid << ": " << trees.error();
++    return;
++  }
++
++  LOG(INFO) << "Killed the following process tree/s:\n"
++            << stringify(trees.get());
++}
++
++
++// Payload read continuation.
++void __read(
++    int pipe,
++    const Future<size_t>& future,
++    const boost::shared_array<char>& data,
++    Owned<Promise<string> > promise)
++{
++  if (future.isFailed()) {
++    promise->fail(future.failure());
++  }
++  if (!future.isReady()) {
++    promise->fail("Future is not ready");
++  }
++
++  // When EOF is reached, return an empty string.
++  if (future.get() == 0) {
++    promise->set(string());
++    return;
++  }
++
++  stringstream in;
++  in.write(data.get(), future.get());
++  promise->set(in.str());
++}
++
++
++// Size read continuation.
++void _read(
++    int pipe,
++    const Future<size_t>& future,
++    const boost::shared_ptr<size_t>& data,
++    Owned<Promise<string> > promise)
++{
++  if (future.isFailed()) {
++    promise->fail(future.failure());
++  }
++  if (!future.isReady()) {
++    promise->fail("Future is not ready");
++  }
++
++  // When EOF is reached, return an empty string.
++  if (future.get() == 0) {
++    promise->set(string());
++    return;
++  }
++
++  size_t size(*data.get());
++  VLOG(2) << "Receiving protobuf sized to " << size << " bytes";
++
++  boost::shared_array<char> buffer(new char[size]);
++
++  io::read(pipe, buffer.get(), size)
++    .onAny(lambda::bind(&__read, pipe, lambda::_1, buffer, promise));
++}
++
++
++Future<string> ExternalContainerizerProcess::read(int pipe)
++{
++  Try<Nothing> nonblock = os::nonblock(pipe);
++  if (nonblock.isError()) {
++    return Failure("Failed to accept nonblock (error: " + nonblock.error()
++      + ")");
++  }
++
++  Owned<Promise<string> > promise(new Promise<string>());
++
++  boost::shared_ptr<size_t> buffer(new size_t);
++
++  io::read(pipe, buffer.get(), sizeof(size_t))
++    .onAny(lambda::bind(&_read, pipe, lambda::_1, buffer, promise));
++
++  return promise->future();
++}
++
++
++Try<bool> ExternalContainerizerProcess::commandSupported(
++    const Future<ResultFutures>& future,
++    string& result)
++{
++  if (!future.isReady()) {
++    return Error("Could not receive any result");
++  }
++
++  Future<Option<int> > statusFuture = tuples::get<1>(future.get());
++  if (statusFuture.isFailed()) {
++    return Error("Could not get an exit-code (error: "
++      + statusFuture.failure() + ")");
++  }
++
++  Option<int> status = statusFuture.get();
++  if (status.isNone()) {
++    return Error("No exit-code available");
++  }
++
++  // The status is a waitpid-result which has to be checked for SIGNAL
++  // based termination before masking out the exit-code.
++  if (!WIFEXITED(status.get())) {
++    return Error(string("External containerizer terminated by signal ")
++      + strsignal(WTERMSIG(status.get())));
++  }
++
++  int exitCode = WEXITSTATUS(status.get());
++  if (exitCode != 0) {
++    return Error("External containerizer failed (exit: "
++      + stringify(exitCode) + ")");
++  }
++
++  Future<string> resultFuture = tuples::get<0>(future.get());
++  if (resultFuture.isFailed()) {
++    return Error("Could not receive any result (error: "
++      + resultFuture.failure() + ")");
++  }
++  result = resultFuture.get();
++
++  bool implemented = !result.empty();
++  if (!implemented) {
++    LOG(INFO) << "External containerizer exited 0 and had no output, which "
++              << "requests the default implementation";
++  }
++
++  return implemented;
++}
++
++
++int setup(const string& directory)
++{
++  // Put child into its own process session to prevent slave suicide
++  // on child process SIGKILL/SIGTERM.
++  if (::setsid() == -1) {
++    return errno;
++  }
++
++  // Re/establish the sandbox conditions for the containerizer.
++  if (::chdir(directory.c_str()) == -1) {
++    return errno;
++  }
++
++  // Sync parent and child process.
++  int sync = 42;
++  while (::write(STDOUT_FILENO, &sync, sizeof(sync)) == -1
++    && errno == EINTR);
++
++  return 0;
++}
++
++
++Try<process::Subprocess> ExternalContainerizerProcess::invoke(
++      const string& command,
++      const ContainerID& containerId,
++      const string& output,
++      const map<string, string>& environment)
++{
++  CHECK(flags.containerizer_path.isSome())
++    << "containerizer_path not set";
++
++  CHECK(sandboxes.contains(containerId));
++
++  VLOG(1) << "Invoking external containerizer for method '" << command << "'";
++
++  // Construct the command to execute.
++  string execute = flags.containerizer_path.get()
++                 + " " + command
++                 + " " + containerId.value();
++
++  VLOG(2) << "calling: [" << execute << "]";
++  VLOG(2) << "directory: " << sandboxes[containerId]->directory;
++  if(sandboxes[containerId]->user.isSome()) {
++    VLOG(2) << "user: " << sandboxes[containerId]->user.get();
++  }
++
++  // Re/establish the sandbox conditions for the containerizer.
++  if (sandboxes[containerId]->user.isSome()) {
++    Try<Nothing> chown = os::chown(
++        sandboxes[containerId]->user.get(),
++        sandboxes[containerId]->directory);
++    if (chown.isError()) {
++      return Error(string("Failed to chown work directory: ") +
++        strerror(errno));
++    }
++  }
++
++  // Fork exec of external process. Run a chdir and a setsid within
++  // the child-context.
++  Try<Subprocess> external = process::subprocess(
++      execute,
++      environment,
++      lambda::bind(&setup, sandboxes[containerId]->directory));
++
++  if (external.isError()) {
++    return Error(string("Failed to execute external containerizer: ")
++      + external.error());
++  }
++
++  // Sync parent and child process to make sure we have done done the
++  // setsid within the child context before continuing.
++  int sync;
++  while (::read(external.get().out(), &sync, sizeof(sync)) == -1
++    && errno == EINTR);
++
++  // Redirect output (stderr) from the external containerizer to log
++  // file in the executor work directory, chown'ing it if a user is
++  // specified.
++  Try<int> err = os::open(
++      path::join(sandboxes[containerId]->directory, "stderr"),
++      O_WRONLY | O_CREAT | O_APPEND | O_NONBLOCK,
++      S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
++
++  if (err.isError()) {
++    return Error("Failed to redirect stderr: " + err.error());
++  }
++
++  Try<Nothing> nonblock = os::nonblock(external.get().err());
++  if (nonblock.isError()) {
++    os::close(err.get());
++    return Error("Failed to redirect stderr: " + nonblock.error());
++  }
++
++  io::splice(external.get().err(), err.get())
++    .onAny(bind(&os::close, err.get()));
++
++  // Transmit protobuf data via stdout towards the external
++  // containerizer. Each message is prefixed by its total size.
++  if (output.length() > 0) {
++    ssize_t len = output.length();
++
++    VLOG(2) << "Writing to child's standard input "
++            << "(" << output.length() + sizeof(len) << " bytes)";
++
++    nonblock = os::nonblock(external.get().in());
++    if (nonblock.isError()) {
++      return Error("Failed to write to stdin: " + nonblock.error());
++    }
++
++    if (write(external.get().in(), &len, sizeof(len)) < sizeof(len)) {
++      return Error("Failed to write protobuf size to pipe");
++    }
++
++    if (write(external.get().in(), output.c_str(), len) < len) {
++      return Error("Failed to write protobuf payload to pipe");
++    }
++  }
++
++  VLOG(2) << "Returning pid: " << external.get().pid();
++  VLOG(2) << "Child output pipe: " << external.get().out();
++
++  return external;
++}
++
++
++ExecutorInfo containerExecutorInfo(
++    const Flags& flags,
++    const TaskInfo& task,
++    const FrameworkID& frameworkId)
++{
++  CHECK_NE(task.has_executor(), task.has_command())
++    << "Task " << task.task_id()
++    << " should have either CommandInfo or ExecutorInfo set but not both";
++
++  if (!task.has_command()) {
++      return task.executor();
++  }
++
++  ExecutorInfo executor;
++  // Command executors share the same id as the task.
++  executor.mutable_executor_id()->set_value(task.task_id().value());
++  executor.mutable_framework_id()->CopyFrom(frameworkId);
++
++  // Prepare an executor name which includes information on the
++  // task and a possibly attached container.
++  string name =
++    "(External Containerizer Task: " + task.task_id().value();
++  if (task.command().has_container()) {
++    name += " Container image: " + task.command().container().image();
++  }
++  name += ")";
++
++  executor.set_name("Command Executor " + name);
++  executor.set_source(task.task_id().value());
++  executor.mutable_command()->MergeFrom(task.command());
++  return executor;
++}
++
++
++string protobufError(const google::protobuf::Message& message)
++{
++  vector<string> errors;
++  message.FindInitializationErrors(&errors);
++  return strings::join(", ", errors);
++}
++
++
++} // namespace slave {
++} // namespace internal {
++} // namespace mesos {
+diff --git a/src/slave/flags.hpp b/src/slave/flags.hpp
+index d5c54c0..4b05d71 100644
+--- a/src/slave/flags.hpp
++++ b/src/slave/flags.hpp
+@@ -57,7 +57,7 @@ public:
+     add(&Flags::isolation,
+         "isolation",
+         "Isolation mechanisms to use, e.g., 'posix/cpu,posix/mem'\n"
+-        "or 'cgroups/cpu,cgroups/mem'.",
++        "or 'cgroups/cpu,cgroups/mem' or 'external'.",
+         "posix/cpu,posix/mem");
+ 
+     add(&Flags::default_role,
+@@ -70,8 +70,8 @@ public:
+         "*");
+ 
+     add(&Flags::attributes,
+-      "attributes",
+-      "Attributes of machine");
++        "attributes",
++        "Attributes of machine");
+ 
+     add(&Flags::work_dir,
+         "work_dir",
+@@ -204,6 +204,16 @@ public:
+         "no cgroup limits are set, they are inherited from the root mesos\n"
+         "cgroup.");
+ #endif
++
++    add(&Flags::containerizer_path,
++        "containerizer_path",
++        "The path to the external containerizer executable used when\n"
++        "external isolation is activated (--isolation=external).\n");
++
++    add(&Flags::default_container_image,
++        "default_container_image",
++        "The default container image to use if not specified by a task,\n"
++        "when using external containerizer");
+   }
+ 
+   bool version;
+@@ -233,6 +243,8 @@ public:
+   bool cgroups_enable_cfs;
+   Option<std::string> slave_subsystems;
+ #endif
++  Option<std::string> containerizer_path;
++  Option<std::string> default_container_image;
+ };
+ 
+ } // namespace mesos {
+diff --git a/src/tests/external_containerizer_test.cpp b/src/tests/external_containerizer_test.cpp
+new file mode 100644
+index 0000000..8ba5253
+--- /dev/null
++++ b/src/tests/external_containerizer_test.cpp
+@@ -0,0 +1,255 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <unistd.h>
++
++#include <gmock/gmock.h>
++
++#include <string>
++#include <vector>
++#include <map>
++
++#include <mesos/resources.hpp>
++
++#include <process/future.hpp>
++
++#include <stout/os.hpp>
++#include <stout/path.hpp>
++
++#include "master/master.hpp"
++#include "master/detector.hpp"
++
++#include "slave/containerizer/containerizer.hpp"
++#include "slave/containerizer/external_containerizer.hpp"
++#include "slave/flags.hpp"
++#include "slave/slave.hpp"
++
++#include "tests/mesos.hpp"
++#include "tests/flags.hpp"
++
++using namespace mesos;
++using namespace mesos::internal;
++using namespace mesos::internal::tests;
++
++using namespace process;
++
++using mesos::internal::master::Master;
++using mesos::internal::slave::Containerizer;
++using mesos::internal::slave::Slave;
++
++using std::string;
++using std::vector;
++
++using testing::_;
++using testing::DoAll;
++using testing::Return;
++using testing::SaveArg;
++
++// TODO(tillt): Update and enhance the ExternalContainerizer tests,
++// possibly following some of the patterns used within the
++// IsolatorTests.
++class ExternalContainerizerTest : public MesosTest {};
++
++
++class TestExternalContainerizer : public slave::ExternalContainerizer
++{
++public:
++  TestExternalContainerizer(slave::Flags flags)
++  : ExternalContainerizer(flags), flags(flags) {}
++
++  Future<ExecutorInfo> launch(
++      const ContainerID& containerId,
++      const TaskInfo& taskInfo,
++      const FrameworkID& frameworkId,
++      const string& directory,
++      const Option<string>& user,
++      const SlaveID& slaveId,
++      const process::PID<Slave>& slavePid,
++      bool checkpoint)
++  {
++    ExecutorInfo executor = containerExecutorInfo(
++        flags, taskInfo, frameworkId);
++    executor.mutable_resources()->MergeFrom(taskInfo.resources());
++
++    std::pair<FrameworkID, ExecutorID> key(executor.framework_id(),
++                                           executor.executor_id());
++    containers[key] = containerId;
++
++    return ExternalContainerizer::launch(
++        containerId,
++        taskInfo,
++        frameworkId,
++        directory,
++        user,
++        slaveId,
++        slavePid,
++        checkpoint);
++  }
++
++  Try<ContainerID> getContainer(
++      const FrameworkID& frameworkId,
++      const ExecutorID& executorId)
++  {
++    std::pair<FrameworkID, ExecutorID> key(frameworkId, executorId);
++    if (!containers.contains(key)) {
++      return Error(
++          "Container for executor '" + stringify(executorId) +
++          "' of framework '" + stringify(frameworkId) + "' not found");
++    }
++    return containers[key];
++  }
++
++private:
++  hashmap<std::pair<FrameworkID, ExecutorID>, ContainerID> containers;
++  const slave::Flags flags;
++};
++
++
++TEST_F(ExternalContainerizerTest, Launch)
++{
++  Try<PID<Master> > master = this->StartMaster();
++  ASSERT_SOME(master);
++
++  Flags testFlags;
++
++  slave::Flags flags = this->CreateSlaveFlags();
++
++  flags.isolation = "external";
++  flags.containerizer_path =
++      string(testFlags.build_dir) + "/src/examples/python/test-containerizer";
++
++  TestExternalContainerizer testContainerizer(flags);
++
++  Try<PID<Slave> > slave = this->StartSlave(&testContainerizer, flags);
++  ASSERT_SOME(slave);
++
++  MockScheduler sched;
++  MesosSchedulerDriver driver(
++      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
++
++  Future<FrameworkID> frameworkId;
++  EXPECT_CALL(sched, registered(&driver, _, _))
++    .WillOnce(FutureArg<1>(&frameworkId));
++
++  Future<vector<Offer> > offers;
++  EXPECT_CALL(sched, resourceOffers(&driver, _))
++    .WillOnce(FutureArg<1>(&offers))
++    .WillRepeatedly(Return()); // Ignore subsequent offers.
++
++  driver.start();
++
++  AWAIT_READY(frameworkId);
++  AWAIT_READY(offers);
++
++  EXPECT_NE(0u, offers.get().size());
++
++  TaskInfo task;
++  task.set_name("isolator_test");
++  task.mutable_task_id()->set_value("1");
++  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
++  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
++
++  Resources resources(offers.get()[0].resources());
++  Option<Bytes> mem = resources.mem();
++  ASSERT_SOME(mem);
++  Option<double> cpus = resources.cpus();
++  ASSERT_SOME(cpus);
++
++  const std::string& file = path::join(flags.work_dir, "ready");
++
++  // This task induces user/system load in a child process by
++  // running top in a child process for ten seconds.
++  task.mutable_command()->set_value(
++#ifdef __APPLE__
++      // Use logging mode with 30,000 samples with no interval.
++      "top -l 30000 -s 0 2>&1 > /dev/null & "
++#else
++      // Batch mode, with 30,000 samples with no interval.
++      "top -b -d 0 -n 30000 2>&1 > /dev/null & "
++#endif
++      "touch " + file +  "; " // Signals that the top command is running.
++      "sleep 60");
++
++  vector<TaskInfo> tasks;
++  tasks.push_back(task);
++
++  Future<TaskStatus> status;
++  EXPECT_CALL(sched, statusUpdate(&driver, _))
++    .WillOnce(FutureArg<1>(&status))
++    .WillRepeatedly(Return()); // Ignore rest for now
++
++  driver.launchTasks(offers.get()[0].id(), tasks);
++
++  AWAIT_READY(status);
++
++  EXPECT_EQ(TASK_RUNNING, status.get().state());
++
++  // Wait for the task to begin inducing cpu time.
++  while (!os::exists(file));
++
++  ExecutorID executorId;
++  executorId.set_value(task.task_id().value());
++
++  // We'll wait up to 10 seconds for the child process to induce
++  // 1/8 of a second of user and system cpu time in total.
++  // TODO(bmahler): Also induce rss memory consumption, by re-using
++  // the balloon framework.
++  ResourceStatistics statistics;
++  Duration waited = Duration::zero();
++  do {
++    Try<ContainerID> containerId =
++        testContainerizer.getContainer(frameworkId.get(), executorId);
++    EXPECT_SOME(containerId);
++
++    Future<ResourceStatistics> usage = testContainerizer.usage(
++        containerId.get());
++    AWAIT_READY(usage);
++
++    statistics = usage.get();
++
++    // If we meet our usage expectations, we're done!
++    if (statistics.cpus_user_time_secs() >= 0.120 &&
++        statistics.cpus_system_time_secs() >= 0.05 &&
++        statistics.mem_rss_bytes() >= 1024u) {
++      break;
++    }
++
++    os::sleep(Milliseconds(100));
++    waited += Milliseconds(100);
++  } while (waited < Seconds(10));
++
++  EXPECT_GE(statistics.cpus_user_time_secs(), 0.120);
++  EXPECT_GE(statistics.cpus_system_time_secs(), 0.05);
++  EXPECT_EQ(statistics.cpus_limit(), cpus.get());
++  EXPECT_GE(statistics.mem_rss_bytes(), 1024u);
++  EXPECT_EQ(statistics.mem_limit_bytes(), mem.get().bytes());
++
++  EXPECT_CALL(sched, statusUpdate(&driver, _))
++    .WillOnce(FutureArg<1>(&status));
++
++  driver.killTask(task.task_id());
++
++  AWAIT_READY(status);
++
++  EXPECT_EQ(TASK_KILLED, status.get().state());
++
++  driver.stop();
++  driver.join();
++
++  this->Shutdown();
++}

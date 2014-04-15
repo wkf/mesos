@@ -222,7 +222,7 @@ public:
   void executorTerminated(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
-      const process::Future<containerizer::Termination>& termination);
+      const process::Future<Containerizer::Termination>& termination);
 
   void _executorTerminated(
       const process::Future<Nothing>& future,
