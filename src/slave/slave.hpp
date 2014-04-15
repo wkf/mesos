@@ -228,7 +228,7 @@ public:
       const process::Future<Nothing>& future,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
-      const process::Future<Containerizer::Termination>& termination,
+      const process::Future<containerizer::Termination>& termination,
       int status);
 
   // NOTE: Pulled these to public to make it visible for testing.
